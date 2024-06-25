@@ -1,0 +1,176 @@
+/**
+ * \file mitysom-a10s-yocto.jenkins
+ *
+ * \brief This pipeline will build all the branches of cl's meta-cl-socfpga layer to make sure they build
+ *
+ * \copyright Critical Link LLC 2018
+ */
+
+pipeline {
+  agent {
+    label 'docker'
+  }
+  parameters {
+    booleanParam(name: 'CLEAN_BUILD', defaultValue: params.CLEAN_BUILD ?: false)
+    booleanParam(name: 'STORE_OUTPUTS', defaultValue: params.STORE_OUTPUTS ?: false)
+    string(name: 'POCKY_BRANCH', defaultValue: params.POCKY_BRANCH ?: 'rocko')
+    string(name: 'META_OPENEMBEDDED_BRANCH', defaultValue: params.META_OPENEMBEDDED_BRANCH ?: 'rocko')
+    string(name: 'META_CL_SOCFPGA_BRANCH', defaultValue: params.META_CL_SOCFPGA_BRANCH ?: 'rocko')
+    string(name: 'YOCTO_MACHINE', defaultValue: params.YOCTO_MACHINE ?: 'mitysom-c5')
+    string(name: 'CROPS_TARGET', defaultValue: params.CROPS_TARGET ?: 'ubuntu-18.04')
+    string(name: 'META_CUSTOMER_BRANCH', defaultValue: params.META_CUSTOMER_BRANCH ?: 'trunk')
+    booleanParam(name: 'EXTERNAL_BUILD', defaultValue: params.EXTERNAL_BUILD ?: true)
+    booleanParam(name: 'BUILD_SDK', defaultValue: params.BUILD_SDK ?: false)
+    booleanParam(name: 'BUILD_SDCARD', defaultValue: params.BUILD_SDCARD ?: false)
+  }
+  environment {
+    GITLAB_CREDS = '4a45910e-4292-47fb-a6b5-734aadf4981f'
+    META_CL_SOCFPGA = 'https://gitlab.syr.criticallink.com/soms/mitysom-socfpga/meta-cl-socfpga.git'
+    EXTERNAL_META_CL_SOCFPGA = 'git://git.criticallink.com/home/git/meta-cl-socfpga.git'
+    POKY = 'git://git.yoctoproject.org/poky'
+    META_OPENEMBEDDED = 'git://git.openembedded.org/meta-openembedded'
+    YOCTO_IMAGE = 'epstech-image-bnet-mps'
+    STORE_LOC_BASE = "/shared/projects/${JOB_NAME}"
+    STORE_LOC = "${STORE_LOC_BASE}/${JOB_NAME}_${BUILD_NUMBER}"
+    YOCTO_TARBALL = "poky/build/tmp/deploy/images/${params.YOCTO_MACHINE}/${YOCTO_IMAGE}-${params.YOCTO_MACHINE}.tar.gz"
+    YOCTO_SDK = 'poky/build/tmp/deploy/sdk/*.sh'
+    YOCTO_SRC = 'poky/build/tmp/deploy/sources'
+    YOCTO_LIC = 'poky/build/tmp/deploy/licenses'
+    YOCTO_CPIO = "poky/build/tmp/deploy/images/${params.YOCTO_MACHINE}/${YOCTO_IMAGE}-${params.YOCTO_MACHINE}.cpio.gz"
+    ARCH_TARBALL = "${YOCTO_IMAGE}-${params.YOCTO_MACHINE}-${BUILD_NUMBER}.tar.gz"
+    ARCH_CPIO = "${YOCTO_IMAGE}-${params.YOCTO_MACHINE}-${BUILD_NUMBER}.cpio.gz"
+	SVN_CREDS = '5c2e74a0-2bb7-4864-aa78-374c9cda0956'
+	META_CUSTOMER = "meta-bnet_mps"
+	SVN_REPO = "https://svnsrv.syr.criticallink.com/svn/epstech/bnet_mps/${params.META_CUSTOMER_BRANCH}/sw/ARM/${META_CUSTOMER}"
+  }
+  options {
+    timeout(time: 12, unit: 'HOURS')
+    buildDiscarder(logRotator(numToKeepStr: '5')) 
+  }
+  stages {
+    stage('Pre Clean') {
+      steps {
+        script {
+          if (params.CLEAN_BUILD == true) {
+            deleteDir()
+          }
+        }
+      }
+    }
+    stage('Checkout Layers') {
+      steps {
+        checkout([$class: 'GitSCM',
+          branches: [[name: "$params.POCKY_BRANCH"]],
+          extensions: [
+            [$class: 'RelativeTargetDirectory', relativeTargetDir: 'poky']
+          ],
+          userRemoteConfigs: [[url: "$POKY"]]
+        ])
+        checkout([$class: 'GitSCM',
+          branches: [[name: "$params.META_OPENEMBEDDED_BRANCH"]],
+          extensions: [
+            [$class: 'RelativeTargetDirectory', relativeTargetDir: 'poky/meta-openembedded']
+          ],
+          userRemoteConfigs: [[url: "$META_OPENEMBEDDED"]]
+        ])
+		checkout([
+			$class: 'SubversionSCM',
+			locations: [[
+				credentialsId: "$SVN_CREDS",
+				remote: "$SVN_REPO",
+				local: "poky/$META_CUSTOMER",
+			]],
+			// "Use 'svn update' whenever possible,
+			// making the build faster. But this causes
+			// the artifacts from the previous build to
+			// remain when a new build starts."
+			workspaceUpdater: [$class: 'UpdateUpdater']
+		])
+        script {
+          if (params.EXTERNAL_BUILD == true) {
+            checkout([$class: 'GitSCM',
+              branches: [[name: "$params.META_CL_SOCFPGA_BRANCH"]],
+              extensions: [
+                [$class: 'RelativeTargetDirectory', relativeTargetDir: 'poky/meta-cl-socfpga']
+              ],
+              userRemoteConfigs: [[url: "$EXTERNAL_META_CL_SOCFPGA"]]
+            ])
+          } else {
+            checkout([$class: 'GitSCM',
+              branches: [[name: "$params.META_CL_SOCFPGA_BRANCH"]],
+              extensions: [
+                [$class: 'RelativeTargetDirectory', relativeTargetDir: 'poky/meta-cl-socfpga']
+              ],
+              userRemoteConfigs: [[credentialsId: "$GITLAB_CREDS", url: "$META_CL_SOCFPGA"]]
+            ])
+          }
+        }
+      }
+    }
+    stage('Build Image') {
+      steps {
+        sh """ 
+        docker pull crops/poky:${params.CROPS_TARGET}
+        docker run --rm -v ${WORKSPACE}/poky:/work -e BUILD_SDK=${params.BUILD_SDK} -e YOCTO_MACHINE=${params.YOCTO_MACHINE} -e META_CUSTOMER=${META_CUSTOMER} crops/poky:${params.CROPS_TARGET} --workdir=/work /bin/bash -c "\
+            . ./oe-init-build-env;\
+            cp ../${META_CUSTOMER}/conf/local.conf.sample conf/local.conf;\
+            cp ../${META_CUSTOMER}/conf/bblayers.conf.sample conf/bblayers.conf;\
+            MACHINE=$YOCTO_MACHINE bitbake $YOCTO_IMAGE;\
+            if [ "${BUILD_SDK}" = true ]; then MACHINE=$YOCTO_MACHINE bitbake $YOCTO_IMAGE -c populate_sdk; fi;\
+            "
+        """ 
+      }
+    }
+    stage('Archive Filesystem') {
+      steps {
+        script {
+          if (params.STORE_OUTPUTS == true) {
+            sh """
+            mkdir -p $STORE_LOC
+            cp $YOCTO_TARBALL $STORE_LOC
+            cp $YOCTO_CPIO $STORE_LOC
+			if [ "${BUILD_SDK}" = true ]
+			then
+				cp $YOCTO_SDK $STORE_LOC
+			fi
+            cp -rf $YOCTO_SRC $STORE_LOC
+            cp -rf $YOCTO_LIC $STORE_LOC
+			ln -sf -T $STORE_LOC ${STORE_LOC_BASE}/latest-yocto
+            """
+          }
+          // The archiver can't handle symlinks, so copy the tarball
+          // symlink before calling the archiver 
+          sh "cp $YOCTO_TARBALL $ARCH_TARBALL"
+          sh "cp $YOCTO_CPIO $ARCH_CPIO"
+        }
+        archiveArtifacts \
+        artifacts: "$ARCH_TARBALL, $ARCH_CPIO", \
+        fingerprint: true, \
+        onlyIfSuccessful: true
+      }
+    }
+    stage('Build FPGA') {
+      steps {
+        script {
+          if (params.BUILD_SDCARD == true) {
+            build job: 'bnet_mps-quartus_sdcard', wait: false
+          }
+        }
+      }
+    }
+  }
+  post {
+    success {
+      script {
+        currentBuild.result = 'SUCCESS'
+        step([$class: 'Mailer', notifyEveryUnstableBuild: true, recipients: "dvincelette@criticallink.com", sendToIndividuals: true])
+      }
+    }
+    failure {
+      script {
+        currentBuild.result = 'FAILURE'
+        step([$class: 'Mailer', notifyEveryUnstableBuild: true, recipients: "dvincelette@criticallink.com", sendToIndividuals: true])
+      }
+    }
+  }
+}
